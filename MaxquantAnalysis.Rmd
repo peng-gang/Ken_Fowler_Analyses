@@ -153,7 +153,7 @@ We combined technical replicates (two 'A5's and two 'B3's) according to the rule
 
 * if intensities of two technical replicates of a protein are all non-zero, the combined intensity is the mean of the two non-zero values. 
 
-Then we removed proteins with missing value in more than 30% of all samples (21 * 0.3 = 6.3). 
+Then we removed proteins with missing value in more than 30% of all samples (21 * 0.3 = 6.3, more than or equal to 7 samples). 
 
 
 ```{r dataClean}
@@ -213,6 +213,7 @@ if(firstRun){
 
 ### Cleaned data summary
 
+#### Principal component analysis
 ```{r pca}
 if(firstRun){
   pr <- prcomp(t(na.omit(as.matrix(log2(protein)))), scale. = TRUE, center = TRUE)
@@ -271,6 +272,7 @@ There is no clear separation between group A and B in PCA analysis as shown belo
 
 ![PCA of cleaned data](figures/PCACleaned.png){width=100%}
 
+#### Hierarchical clustering analysis
 ```{r heatmap}
 if(firstRun){
   
@@ -463,6 +465,7 @@ kable(tmp, caption = "Significant Genes (Mann-Whitney Test)") %>%
 ![Volcano plot of Mann-Whitney Test](figures/volcanoMWTest.png){width=50%}
 
 ### Pathway Level
+Gene set enrichment analysis was used to find out significant KEGG pathways. Top 10 pathways were shown in dot plot and upset plot. 
 
 ```{r pathway}
 if(firstRun){
