@@ -1,0 +1,501 @@
+---
+title: "Analysis of Data from Maxquant"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: united
+---
+
+
+```{r setup, include=FALSE}
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(ggrepel)
+library(ComplexHeatmap)
+library(ggsci)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+firstRun <- TRUE
+```
+
+
+## Data summary and data cleaning
+
+### Raw data summary
+
+There are 3919 proteins from 24 samples including 4 technical replicates (A5 and B3) in raw data. 
+
+```{r dataLoading}
+if(firstRun){
+  raw <- read.table(
+    "../data/Maxquant/Intensity_Protein_70perfilter_anycondition.txt", header = TRUE,
+    sep = "\t", strip.white = TRUE, blank.lines.skip = TRUE)
+  
+  proteinRaw <- raw[,1:24]
+  proteinInfo <- raw[,25:40]
+  tmp <- colnames(proteinRaw)
+  sampleName <- sapply(strsplit(tmp, "_"), function(x) {x[4]})
+  techName <- sampleName
+  techName[sampleName=="A5"] <- c("A5_1", "A5_2")
+  techName[sampleName=="B3"] <- c("B3_1", "B3_2")
+  colnames(proteinRaw) <- techName
+  
+  sampleInfoRaw <- data.frame(
+    sampleName = sampleName,
+    techName = techName,
+    group = stringr::str_sub(sampleName, 1, 1),
+    stringsAsFactors = FALSE
+  )
+  
+  numMissingSample <- colSums(is.na(proteinRaw))
+  numMissingProtein <- rowSums(is.na(proteinRaw))
+  
+  gp <- ggplot(data.frame(x=numMissingSample)) + 
+    geom_histogram(
+      aes(x=x), bins = 10, color = "black", fill = "grey"
+    ) + 
+    labs(x="Num Missing Per Sample", y="Frequency") + 
+    theme_classic()
+  png("figures/histNumMissingPerSample.png", width = 5, height = 4, units = "in", res = 300)
+    print(gp)
+  invisible(dev.off())
+  
+  
+  gp <- ggplot(data.frame(x=numMissingProtein)) + 
+    geom_histogram(
+      aes(x=x), bins = 11, color = "black", fill = "grey",
+      breaks = seq(-0.5, 11.5, by = 1)
+    ) + 
+    labs(x="Num Missing Per Protein", y="Frequency") + 
+    theme_classic()
+  png("figures/histNumMissingPerProgein.png", width = 5, height = 4, units = "in", res = 300)
+    print(gp)
+  invisible(dev.off())
+}
+
+```
+
+The figure below shows the number of missing value for each sample. There is one sample (A11) with more missing values than others.
+
+![Missing value per sample](figures/histNumMissingPerSample.png){width=50%}
+
+
+```{r pcaRaw}
+if(firstRun){
+  pr <- prcomp(t(na.omit(as.matrix(log2(proteinRaw)))), scale. = TRUE, center = TRUE)
+  spr <- summary(pr)
+  
+  dplot <- data.frame(pr$x)
+  dplot$group <- sampleInfoRaw$group
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="group"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          scale_color_npg() + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  figWidth <- 9
+  figHeight <- 8
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  png("figures/PCARaw.png", width = figWidth, height = figHeight, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+```
+
+PCA also shows that A11 is an outlier (very large PC2). I decided to remove A11 from the following analysis. 
+
+PC1 accounts for a very big variation (45%), much larger than the data from Scaffold. There are much more proteins in Maxquant than in Scaffold. The proteins found in Maxquant have higher correlation than the proteins found in Scaffold. 
+
+![PCA of raw data](figures/PCARaw.png){width=100%}
+
+
+### Data clean and technical replicates combination
+We combined technical replicates (two 'A5's and two 'B3's) according to the rules below:
+
+* if intensities of two technical replicates of a protein are all zero, the combined intensity is zero
+
+* if intensities of two technical replicates of a protein are zero and non-zero, the non-zero value was accepted as the combined intensity
+
+* if intensities of two technical replicates of a protein are all non-zero, the combined intensity is the mean of the two non-zero values. 
+
+Then we removed proteins with missing value in more than 30% of all samples (21 * 0.3 = 6.3). 
+
+
+```{r dataClean}
+if(firstRun){
+  idxA11 <- which(sampleInfoRaw$techName == "A11")
+  proteinRaw <- proteinRaw[,-idxA11]
+  sampleInfoRaw <- sampleInfoRaw[-idxA11,]
+  
+  # technical duplicates
+  idxA5 <- which(sampleInfoRaw$sampleName == "A5")
+  idxB3 <- which(sampleInfoRaw$sampleName == "B3")
+  
+  protein <- proteinRaw[,-c(idxA5, idxB3)]
+  sampleInfo <- sampleInfoRaw[-c(idxA5, idxB3), ]
+  
+  proteinTmp <- proteinRaw[,idxA5]
+  tmp <- apply(proteinTmp, 1, function(x) {
+    ifelse(
+      sum(is.na(x)) == 2, NA, 
+      ifelse(
+        sum(is.na(x)) == 1, x[!is.na(x)], mean(x)))
+  })
+  protein <- cbind(protein, tmp)
+  sampleInfo <- rbind(sampleInfo, c("A5", "A5", "A"))
+  
+  
+  proteinTmp <- proteinRaw[,idxB3]
+  tmp <- apply(proteinTmp, 1, function(x) {
+    ifelse(
+      sum(is.na(x)) == 2, NA, 
+      ifelse(
+        sum(is.na(x)) == 1, x[!is.na(x)], mean(x)))
+  })
+  protein <- cbind(protein, tmp)
+  sampleInfo <- rbind(sampleInfo, c("B3", "B3", "B"))
+  
+  colnames(protein) <- sampleInfo$sampleName
+  
+  # remove low quality proteins
+  idxLowQProtein <- which(rowSums(is.na(protein)) > ncol(protein) * 0.3)
+  protein <- protein[-idxLowQProtein,]
+  proteinInfo <- proteinInfo[-idxLowQProtein,]
+  
+  idx <- match(c(paste0("A", 1:10), paste0("B", 1:11)), sampleInfo$sampleName)
+  
+  protein <- protein[, idx]
+  sampleInfo <- sampleInfo[idx, ]
+  
+  save(protein, proteinInfo, sampleInfo, file = "data/dataCleaned.RData")
+} else {
+  load("data/dataCleaned.RData")
+}
+
+```
+
+
+
+### Cleaned data summary
+
+```{r pca}
+if(firstRun){
+  pr <- prcomp(t(na.omit(as.matrix(log2(protein)))), scale. = TRUE, center = TRUE)
+  spr <- summary(pr)
+  
+  dplot <- data.frame(pr$x)
+  dplot$group <- sampleInfo$group
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="group"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          scale_color_npg() + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  figWidth <- 9
+  figHeight <- 8
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  png("figures/PCACleaned.png", width = figWidth, height = figHeight, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+```
+
+There is no clear separation between group A and B in PCA analysis as shown below. B9 has relatively large PC3 and PC4. 
+
+![PCA of cleaned data](figures/PCACleaned.png){width=100%}
+
+```{r heatmap}
+if(firstRun){
+  
+  scaledLogProtein <- t(scale(t(log2(protein))))
+  
+  colorGroup <- c(
+    "A" = "#E64B35FF",
+    "B" = "#4DBBD5FF"
+  )
+  ta <- columnAnnotation(
+    Group = sampleInfo$group,
+    col = list(
+      Group = colorGroup
+    ),
+    annotation_legend_param = list(Group = list(nrow = 1, title = "Group")),
+    show_annotation_name = FALSE
+  )
+  
+  hm <- Heatmap(
+    scaledLogProtein, 
+    top_annotation = ta,
+    show_row_dend = FALSE,
+    show_row_names = FALSE,
+    heatmap_legend_param = list(
+      title = "Scaled Log2 Intensity",
+      direction = "horizontal"
+    ),
+    use_raster = TRUE, raster_device = "png"
+  )
+  
+  png("figures/heatmapCleaned.png", width = 7, height = 10, units = "in", res = 300)
+  draw(hm, heatmap_legend_side = "bottom", 
+     annotation_legend_side = "bottom",
+     merge_legend = TRUE)
+  invisible(dev.off())
+}
+```
+
+We cannot see clear clustering from the heatmap shown below. 
+
+![Heatmap of cleaned data](figures/heatmapCleaned.png){width=100%}
+
+
+## Data analysis
+
+### Protein Level
+
+Two tests, t-test and Mann-Whitney test were used to compare group A and B. If there are missing values in a protein, I removed the missing value before the test and ratio calculation. For example:
+
+* Group A: 100, 200, NA, 200
+* Group B: 200, 300, 100, NA
+
+I will test and calculate ratio with the following data:
+
+* Group A: 100, 200, 200
+* Group B: 200, 300, 100
+
+
+```{r analysis}
+
+if(firstRun){
+  pvT <- NULL
+  pvMW <- NULL
+  ratio <- NULL
+  idxA <- which(sampleInfo$group == "A")
+  idxB <- which(sampleInfo$group == "B")
+  
+  for(i in 1:nrow(protein)){
+    dA <- protein[i, idxA]
+    dB <- protein[i, idxB]
+    
+    dA <- dA[!is.na(dA)]
+    dB <- dB[!is.na(dB)]
+    
+    tmp <- t.test(log2(dA), log2(dB))
+    pvT <- c(pvT, tmp$p.value)
+    
+    tmp <- wilcox.test(dA, dB)
+    pvMW <- c(pvMW, tmp$p.value)
+    
+    ratio <- c(ratio, mean(dB)/mean(dA))
+  }
+  
+  fdrT <- p.adjust(pvT, method = "fdr")
+  fdrMW <- p.adjust(pvMW, method = "fdr")
+  
+  
+  rlt <- data.frame(
+    UniProt = sapply(strsplit(proteinInfo$Majority.protein.IDs, ";"), function(x) {x[1]}),
+    GeneSymbol = proteinInfo$Gene.names,
+    log2Ratio = log2(ratio),
+    pvalueTTest = pvT,
+    fdrTTest = fdrT,
+    pvalueMWTest = pvMW,
+    fdrMWTest = fdrMW
+  )
+  
+  
+  write.csv(rlt, file = "tables/pvProtein.csv", quote = TRUE, row.names = FALSE)
+  saveRDS(rlt, file = "data/pvGene.rds")
+}
+
+```
+
+The table and volcano plot below show the significant proteins from t-test (p value < 0.05 and log2 Ratio > 1 or log2 Ratio < -1). 
+
+```{r TTest}
+dplot <- data.frame(
+  UniProt = rlt$UniProt,
+  Symbol = rlt$GeneSymbol,
+  pvalue = rlt$pvalueTTest,
+  logP = -log10(rlt$pvalueTTest),
+  log2Ratio = rlt$log2Ratio,
+  stringsAsFactors = FALSE
+)
+
+dplot$group <- "G0"
+dplot$group[dplot$pvalue<0.05 & dplot$log2Ratio < -1] <- "G1"
+dplot$group[dplot$pvalue<0.05 & dplot$log2Ratio > 1] <- "G2"
+
+dplotText <- dplot[dplot$group!="G0",]
+
+if(firstRun){
+  gp <- ggplot(dplot) +
+    geom_point(aes(x=log2Ratio, y = logP, color = group), size = 1) + 
+    geom_vline(xintercept = c(-1,1), color = "grey", linetype = 2) + 
+    geom_hline(yintercept = -log10(0.05), color = "grey", linetype = 2) + 
+    geom_text_repel(data = dplotText, aes(x=log2Ratio, y=logP, label = Symbol, color = group), size = 3)+
+    scale_color_manual(values = c(G0="grey", G1="#0072B5FF", G2="#BC3C29FF")) + 
+    labs(x = "log2 Ratio", y="-log10 (p value)") + 
+    theme_classic() + 
+    theme(legend.position = "none")
+
+  
+  png("figures/volcanoTTest.png", width = 5, height = 4, units = "in", res = 300)
+  gp
+  invisible(dev.off())
+}
+
+tmp <- dplotText[,c(1,2,5,3)]
+rownames(tmp) <- NULL
+kable(tmp, caption = "Significant Genes (T-Test)") %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+![Volcano plot of T-Test](figures/volcanoTTest.png){width=50%}
+
+
+The table and volcano plot below show the significant proteins from Mann-Whitney test (p value < 0.05 and log2 Ratio > 1 or log2 Ratio < -1). 
+
+```{r MWTest}
+dplot <- data.frame(
+  UniProt = rlt$UniProt,
+  Symbol = rlt$GeneSymbol,
+  pvalue = rlt$pvalueMWTest,
+  logP = -log10(rlt$pvalueMWTest),
+  log2Ratio = rlt$log2Ratio,
+  stringsAsFactors = FALSE
+)
+
+dplot$group <- "G0"
+dplot$group[dplot$pvalue<0.05 & dplot$log2Ratio < -1] <- "G1"
+dplot$group[dplot$pvalue<0.05 & dplot$log2Ratio > 1] <- "G2"
+
+dplotText <- dplot[dplot$group!="G0",]
+
+if(firstRun){
+  gp <- ggplot(dplot) +
+    geom_point(aes(x=log2Ratio, y = logP, color = group), size = 1) + 
+    geom_vline(xintercept = c(-1,1), color = "grey", linetype = 2) + 
+    geom_hline(yintercept = -log10(0.05), color = "grey", linetype = 2) + 
+    geom_text_repel(data = dplotText, aes(x=log2Ratio, y=logP, label = Symbol, color = group), size = 3)+
+    scale_color_manual(values = c(G0="grey", G1="#0072B5FF", G2="#BC3C29FF")) + 
+    labs(x = "log2 Ratio", y="-log10 (p value)") + 
+    theme_classic() + 
+    theme(legend.position = "none")
+
+  
+  png("figures/volcanoTTest.png", width = 5, height = 4, units = "in", res = 300)
+  gp
+  invisible(dev.off())
+}
+
+tmp <- dplotText[,c(1,2,5,3)]
+rownames(tmp) <- NULL
+kable(tmp, caption = "Significant Genes (Mann-Whitney Test)") %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+![Volcano plot of Mann-Whitney Test](figures/volcanoMWTest.png){width=50%}
+
+### Pathway Level
+
+```{r pathway}
+if(firstRun){
+  geneList <- dplot$log2Ratio
+  names(geneList) <- dplot$UniProt
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  gKEGG <- clusterProfiler::gseKEGG(
+    geneList     = geneList,
+    organism     = 'rno', 
+    keyType = "uniprot",
+    minGSSize    = 10,
+    pvalueCutoff = 1,
+    verbose      = FALSE)
+  
+  png("figures/dotPlotKEGG.png", width = 7, height = 7, units = "in", res = 300)
+  enrichplot::dotplot(gKEGG)
+  invisible(dev.off())
+  
+  png("figures/upsetKEGG.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gKEGG)
+  invisible(dev.off())
+}
+```
+
+
+![Dot plot of KEGG pathway analysis](figures/dotPlotKEGG.png){width=50%}
+
+
+![Upset plot of KEGG pathway analysis](figures/upsetKEGG.png){width=50%}
+
+
+
+
+
+
